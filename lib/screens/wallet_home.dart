@@ -297,6 +297,7 @@ class _BalanceHero extends StatelessWidget {
     final i18n = AppLocalizations.of(context)!;
     final showFiat = !fiatRate.isDisabled && unlockedBalanceFiat != null;
     final coinText = '${_amountText(unlockedBalance)} XMR';
+    final balanceTextStyle = _getBalanceStyle(context, coinText);
 
     return Padding(
       padding: const EdgeInsets.fromLTRB(20, 30, 20, 24),
@@ -315,10 +316,10 @@ class _BalanceHero extends StatelessWidget {
                         style: _balanceStyle,
                       )
                     : (!fiatRate.isDisabled && !fiatRate.hasFailed)
-                    ? Skeletonizer(child: Text('0.000000000000', style: _balanceStyle))
+                    ? Skeletonizer(child: Text('0.000000000000', style: balanceTextStyle))
                     : (fiatRate.hasFailed && !fiatRate.isDisabled)
-                    ? Text('--', style: _balanceStyle)
-                    : Text(coinText, style: _balanceStyle),
+                    ? Text('--', style: balanceTextStyle)
+                    : Text(coinText, style: balanceTextStyle),
               ),
               if (fiatRate.hasFailed && !fiatRate.isDisabled) ...[
                 const SizedBox(width: 8),
@@ -526,6 +527,7 @@ class DesktopHomeView extends StatelessWidget {
 
     final showFiat = !fiatRate.isDisabled && v.unlockedBalanceFiat != null;
     final coinText = '${_amountText(v.unlockedBalance)} XMR';
+    final bigBalanceTextStyle = _getBalanceStyle(context, coinText);
     final cw = xmrWallet(context);
     final configured = cw != null && cw.connectionAddress.isNotEmpty;
 
@@ -565,10 +567,10 @@ class DesktopHomeView extends StatelessWidget {
                                         style: _bigBalance,
                                       )
                                     : (!fiatRate.isDisabled && !fiatRate.hasFailed)
-                                    ? Skeletonizer(child: Text('0.000000000000', style: _bigBalance))
+                                    ? Skeletonizer(child: Text('0.000000000000', style: bigBalanceTextStyle))
                                     : (fiatRate.hasFailed && !fiatRate.isDisabled)
-                                    ? Text('--', style: _bigBalance)
-                                    : Text(coinText, style: _bigBalance),
+                                    ? Text('--', style: bigBalanceTextStyle)
+                                    : Text(coinText, style: bigBalanceTextStyle),
                               ),
                               if (fiatRate.hasFailed && !fiatRate.isDisabled) ...[
                                 const SizedBox(width: 8),
