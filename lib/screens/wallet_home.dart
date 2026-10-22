@@ -35,6 +35,61 @@ TextStyle get _balanceSubStyle =>
 /// Monero is decimal-12; show the full precision.
 String _amountText(double amount) => amount.toStringAsFixed(12);
 
+/// Returns a TextStyle with a font size scaled down if the balance text is too long.
+TextStyle _getBalanceStyle(BuildContext context, String text) {
+  // Base styles
+  final baseMobile = TextStyle(
+    fontFamily: 'Ubuntu Mono',
+    fontSize: 33,
+    height: 1,
+    fontWeight: FontWeight.w700,
+    letterSpacing: -0.66,
+    color: BrandColors.ink,
+    fontFeatures: const [FontFeature.tabularFigures()],
+  );
+
+  final baseDesktop = TextStyle(
+    fontFamily: 'Ubuntu Mono',
+    fontSize: 44,
+    height: 1,
+    fontWeight: FontWeight.w700,
+    letterSpacing: -0.88,
+    color: BrandColors.ink,
+    fontFeatures: const [FontFeature.tabularFigures()],
+  );
+
+  // If the text is short enough, return the base style
+  if (text.length <= 12) {
+    return isDesktop ? baseDesktop : baseMobile;
+  }
+
+  // Calculate a reduced font size based on length
+  // We want to fit within roughly 90% of the screen width minus padding
+  final screenWidth = MediaQuery.of(context).size.width;
+  final maxWidth = screenWidth * 0.9; // Leave some margin
+  
+  // Estimate character width (monospace, approx 0.6em per char)
+  // A safe multiplier for monospace fonts is usually between 0.5 and 0.7
+  final estimatedCharWidth = maxWidth / text.length;
+  
+  // Scale down until it fits, but don't go below 18px
+  var fontSize = isDesktop ? 44.0 : 33.0;
+  
+  // Simple heuristic: if the estimated width exceeds max, reduce font size
+  // This loop ensures we find the largest font that fits
+  while (fontSize > 18) {
+    final currentWidth = text.length * fontSize * 0.6; // Approximate monospace width factor
+    if (currentWidth <= maxWidth) {
+      break;
+    }
+    fontSize -= 1.0;
+  }
+  
+  return isDesktop 
+      ? baseDesktop.copyWith(fontSize: fontSize) 
+      : baseMobile.copyWith(fontSize: fontSize);
+}
+
 /// The resolved LWS connection state, driving the disconnected indicator.
 enum StatusIconStatus { loading, complete, fail }
 
