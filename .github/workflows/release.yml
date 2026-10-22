@@ -1,0 +1,520 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check-version:
+    name: Check version match
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      version_matches: ${{ steps.check.outputs.VERSION_MATCHES }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Check if pubspec version matches tag
+        id: check
+        run: |
+          TAG_VERSION="${GITHUB_REF#refs/tags/v}"
+          PUBSPEC_VERSION=$(grep -E '^version:\s+' pubspec.yaml | sed 's/version:\s*//' | cut -d'+' -f1)
+          PUBSPEC_BUILD=$(grep -E '^version:\s+' pubspec.yaml | sed 's/version:\s*//' | grep -oE '\+[0-9]+$' | tr -d '+' || echo "0")
+
+          echo "Tag version: ${TAG_VERSION}"
+          echo "Pubspec version: ${PUBSPEC_VERSION}"
+          echo "Pubspec build number: ${PUBSPEC_BUILD}"
+
+          if [ "${TAG_VERSION}" = "${PUBSPEC_VERSION}" ]; then
+            echo "VERSION_MATCHES=true" >> $GITHUB_OUTPUT
+            echo "Versions match!"
+          else
+            echo "VERSION_MATCHES=false" >> $GITHUB_OUTPUT
+            echo "NEW_VERSION=${TAG_VERSION}" >> $GITHUB_OUTPUT
+            echo "NEW_BUILD=$((PUBSPEC_BUILD + 1))" >> $GITHUB_OUTPUT
+            echo "Version mismatch - will create PR to update pubspec.yaml"
+          fi
+
+      - name: Update pubspec.yaml version
+        if: steps.check.outputs.VERSION_MATCHES == 'false' && !endsWith(github.ref_name, '-test')
+        run: |
+          TAG_VERSION="${GITHUB_REF#refs/tags/v}"
+          PUBSPEC_BUILD=$(grep -E '^version:\s+' pubspec.yaml | sed 's/version:\s*//' | grep -oE '\+[0-9]+$' | tr -d '+' || echo "0")
+          NEW_BUILD=$((PUBSPEC_BUILD + 1))
+          NEW_FULL_VERSION="${TAG_VERSION}+${NEW_BUILD}"
+
+          echo "Updating pubspec.yaml to version ${NEW_FULL_VERSION}"
+          sed -i "s/^version:.*$/version: ${NEW_FULL_VERSION}/" pubspec.yaml
+
+          echo "Updated pubspec.yaml:"
+          grep "^version:" pubspec.yaml
+
+      - name: Create Pull Request
+        if: steps.check.outputs.VERSION_MATCHES == 'false' && !endsWith(github.ref_name, '-test')
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "chore: bump version to ${{ github.ref_name }}"
+          title: "chore: bump version to ${{ github.ref_name }}"
+          body: |
+            This PR updates the pubspec.yaml version to match the release tag `${{ github.ref_name }}`.
+
+            Once merged, re-run the release workflow for this tag.
+          branch: version-bump/${{ github.ref_name }}
+          base: main
+
+      - name: Fail if version mismatch
+        if: steps.check.outputs.VERSION_MATCHES == 'false' && !endsWith(github.ref_name, '-test')
+        run: |
+          echo "::error::Version mismatch detected. A PR has been created to update pubspec.yaml."
+          echo "Please merge the PR and re-trigger this workflow."
+          exit 1
+
+  version:
+    name: Extract version
+    runs-on: ubuntu-latest
+    needs: check-version
+    outputs:
+      version: ${{ steps.version.outputs.VERSION }}
+      tag: ${{ steps.version.outputs.TAG }}
+      flutter_version: ${{ steps.flutter.outputs.FLUTTER_VERSION }}
+    steps:
+      - name: Extract version from tag
+        id: version
+        run: |
+          echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          echo "TAG=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          sparse-checkout: pubspec.yaml
+          sparse-checkout-cone-mode: false
+
+      - name: Extract Flutter version from pubspec.yaml
+        id: flutter
+        run: |
+          FLUTTER_VERSION=$(grep -E '^\s+flutter:\s+' pubspec.yaml | head -1 | sed 's/.*flutter:\s*//')
+          echo "FLUTTER_VERSION=${FLUTTER_VERSION}" >> $GITHUB_OUTPUT
+          echo "Using Flutter version: ${FLUTTER_VERSION}"
+
+  verify-native:
+    name: Verify monero_c binaries
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Binaries match the pinned monero_c commit
+        run: |
+          set -euo pipefail
+          EXPECTED=$(awk '/^  monero:/{f=1} f&&/resolved-ref:/{gsub(/"/,"",$2);print $2;exit}' pubspec.lock)
+          [ -n "$EXPECTED" ] || { echo "::error::no monero resolved-ref in pubspec.lock"; exit 1; }
+          MANIFEST=$(sed -n 's/^# monero_c //p' monero_c.sha256)
+          if [ "$EXPECTED" != "$MANIFEST" ]; then
+            echo "::error::monero_c.sha256 pins $MANIFEST but pubspec.lock pins $EXPECTED"
+            exit 1
+          fi
+          sha256sum -c monero_c.sha256
+
+  build-android:
+    name: Android
+    runs-on: ubuntu-latest
+    environment: Release
+    needs: [version, verify-native]
+    steps:
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af
+          df -h
+
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          submodules: recursive
+
+      - name: Pull builder image
+        run: docker pull ghcr.io/magicgrants/skylight-wallet-builder:latest
+
+      - name: Verify builder image provenance
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          IMAGE=ghcr.io/magicgrants/skylight-wallet-builder
+          DIGEST=$(docker inspect --format='{{range .RepoDigests}}{{println .}}{{end}}' "$IMAGE:latest" | grep "^$IMAGE@" | head -n1 | cut -d@ -f2)
+          test -n "$DIGEST"
+          echo "Builder image: $IMAGE@$DIGEST"
+          # The signing build must only ever run inside an image the image
+          # workflow published from main, so a :latest moved by a dispatch from
+          # any other ref is rejected before a single secret is written.
+          gh attestation verify "oci://$IMAGE@$DIGEST" \
+            --repo MAGICGrants/skylight-wallet \
+            --cert-identity-regex '^https://github\.com/(?i:MAGICGrants)/skylight-wallet/\.github/workflows/build-builder-image\.yml@refs/heads/main$'
+          echo "BUILDER_IMAGE=$IMAGE@$DIGEST" >> "$GITHUB_ENV"
+
+      - name: Assert builder Flutter version matches pubspec
+        run: |
+          set -euo pipefail
+          EXPECTED='${{ needs.version.outputs.flutter_version }}'
+          ACTUAL=$(docker run --rm "$BUILDER_IMAGE" flutter --version --machine 2>/dev/null | jq -r '.frameworkVersion')
+          echo "builder Flutter: $ACTUAL / pubspec: $EXPECTED"
+          if [ "$EXPECTED" != "$ACTUAL" ]; then
+            echo "::error::Builder Flutter $ACTUAL does not match pubspec $EXPECTED"
+            exit 1
+          fi
+
+      - name: Build unsigned APKs and AAB
+        run: |
+          VERSION='${{ needs.version.outputs.version }}'
+          # Deterministic timestamp for reproducible builds
+          export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          # No key.properties: gradle debug-signs; the real key is applied in the signing pass.
+          # Fixed build path for reproducibility
+          docker run --rm \
+            -v "$PWD:/tmp/skylight" \
+            -w /tmp/skylight \
+            -e SOURCE_DATE_EPOCH \
+            "$BUILDER_IMAGE" \
+            bash -c "cp -a /opt/cargo /tmp/skylight-cargo && export CARGO_HOME=/tmp/skylight-cargo && export PUB_CACHE=/tmp/skylight/.pub-cache && flutter pub get --enforce-lockfile && bash scripts/pin-rust-toolchain.sh && flutter build apk --dart-define=DEMO_MODE=true --release --split-per-abi && flutter build appbundle --dart-define=DEMO_MODE=true --release -PplayStore=true"
+
+          mkdir -p dist
+          cp -v build/app/outputs/flutter-apk/app-arm64-v8a-release.apk "dist/skylight-wallet-${VERSION}-arm64-v8a.apk"
+          cp -v build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk "dist/skylight-wallet-${VERSION}-armeabi-v7a.apk"
+          cp -v build/app/outputs/flutter-apk/app-x86_64-release.apk "dist/skylight-wallet-${VERSION}-x86_64.apk"
+          cp -v build/app/outputs/bundle/release/app-release.aab "dist/skylight-wallet-${VERSION}.aab"
+
+      - name: Sign APKs and AAB
+        env:
+          KS_PASS: ${{ secrets.ANDROID_STORE_PASSWORD }}
+          KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > "$RUNNER_TEMP/keystore.jks"
+          # Network-free signing pass: key never shares a process with the build.
+          # APKs get the app key; the AAB the Play upload key (debug JAR sig stripped first).
+          docker run --rm \
+            -v "$PWD/dist:/work" \
+            -v "$RUNNER_TEMP/keystore.jks:/keystore.jks:ro" \
+            -w /work \
+            -e KS_PASS -e KEY_PASS -e KEY_ALIAS \
+            "$BUILDER_IMAGE" \
+            bash -c '
+              set -euo pipefail
+              apksigner=$(ls -d "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -n1)
+              zipalign=$(ls -d "$ANDROID_HOME"/build-tools/*/zipalign | sort -V | tail -n1)
+              for apk in *.apk; do
+                "$zipalign" -p -f 4 "$apk" "$apk.aligned"
+                mv "$apk.aligned" "$apk"
+                "$apksigner" sign --ks /keystore.jks --ks-pass env:KS_PASS --key-pass env:KEY_PASS --ks-key-alias "$KEY_ALIAS" "$apk"
+                "$apksigner" verify --verbose "$apk"
+              done
+              for aab in *.aab; do
+                zip -d "$aab" "META-INF/*.RSA" "META-INF/*.SF" "META-INF/*.DSA" "META-INF/*.EC" >/dev/null 2>&1 || true
+                jarsigner -keystore /keystore.jks -storepass "$KS_PASS" -keypass "$KEY_PASS" -sigalg SHA256withRSA -digestalg SHA-256 "$aab" "$KEY_ALIAS"
+                jarsigner -keystore /keystore.jks -storepass "$KS_PASS" -verify "$aab"
+              done
+            '
+          rm -f "$RUNNER_TEMP/keystore.jks"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: android
+          path: |
+            dist/*.apk
+            dist/*.aab
+
+  build-linux-x86_64:
+    name: Linux (x86_64)
+    runs-on: ubuntu-latest
+    environment: Release
+    needs: [version, verify-native]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          submodules: recursive
+
+      - name: Pull builder image
+        run: docker pull ghcr.io/magicgrants/skylight-wallet-builder:latest
+
+      - name: Verify builder image provenance
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          IMAGE=ghcr.io/magicgrants/skylight-wallet-builder
+          DIGEST=$(docker inspect --format='{{range .RepoDigests}}{{println .}}{{end}}' "$IMAGE:latest" | grep "^$IMAGE@" | head -n1 | cut -d@ -f2)
+          test -n "$DIGEST"
+          echo "Builder image: $IMAGE@$DIGEST"
+          # The signing build must only ever run inside an image the image
+          # workflow published from main, so a :latest moved by a dispatch from
+          # any other ref is rejected before a single secret is written.
+          gh attestation verify "oci://$IMAGE@$DIGEST" \
+            --repo MAGICGrants/skylight-wallet \
+            --cert-identity-regex '^https://github\.com/(?i:MAGICGrants)/skylight-wallet/\.github/workflows/build-builder-image\.yml@refs/heads/main$'
+          echo "BUILDER_IMAGE=$IMAGE@$DIGEST" >> "$GITHUB_ENV"
+
+      - name: Assert builder Flutter version matches pubspec
+        run: |
+          set -euo pipefail
+          EXPECTED='${{ needs.version.outputs.flutter_version }}'
+          ACTUAL=$(docker run --rm "$BUILDER_IMAGE" flutter --version --machine 2>/dev/null | jq -r '.frameworkVersion')
+          echo "builder Flutter: $ACTUAL / pubspec: $EXPECTED"
+          if [ "$EXPECTED" != "$ACTUAL" ]; then
+            echo "::error::Builder Flutter $ACTUAL does not match pubspec $EXPECTED"
+            exit 1
+          fi
+
+      - name: Build Linux packages
+        run: |
+          # cargokit builds the Rust plugins with `rustup run stable`, and the
+          # image only has the rust-toolchain.toml version, so pin cargokit to it
+          # (as the Android job does) instead of downloading stable mid-build.
+          VERSION='${{ needs.version.outputs.version }}'
+          docker run --rm \
+            -v "$PWD:/workspace" \
+            -w /workspace \
+            "$BUILDER_IMAGE" \
+            bash -c "flutter pub get --enforce-lockfile && bash scripts/pin-rust-toolchain.sh && flutter build linux --release && ./deb/build_deb.sh --version ${VERSION} && ./appimage/build_appimage.sh --version ${VERSION}"
+
+          mkdir -p dist
+          cp -v deb/skylight-wallet-*.deb dist/
+          cp -v appimage/skylight-wallet-*.AppImage dist/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: linux-x86_64
+          path: |
+            dist/*.deb
+            dist/*.AppImage
+
+  build-windows:
+    name: Windows (x64)
+    runs-on: windows-2022
+    environment: Release
+    needs: [version, verify-native]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          submodules: recursive
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
+        with:
+          channel: stable
+          flutter-version: ${{ needs.version.outputs.flutter_version }}
+
+      - name: Install dependencies
+        run: flutter pub get --enforce-lockfile
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y
+
+      # webcrypto builds BoringSSL, whose Windows assembly needs NASM.
+      - name: Install NASM
+        run: |
+          choco install nasm -y
+          echo "C:\Program Files\NASM" >> $env:GITHUB_PATH
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: stable
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build Windows release
+        run: flutter build windows --release
+
+      - name: Create installer
+        run: |
+          $version = '${{ needs.version.outputs.version }}'.TrimStart('v')
+          & 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' /DAppVersion=$version windows\installer.iss
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-x64
+          path: windows/Output/*.exe
+
+  build-ios:
+    name: iOS
+    runs-on: macos-26
+    environment: Release
+    needs: [version, verify-native]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          submodules: recursive
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
+        with:
+          channel: stable
+          flutter-version: ${{ needs.version.outputs.flutter_version }}
+
+      - name: Install CocoaPods
+        run: |
+          brew untap aws/tap 2>/dev/null || true   # runner pre-taps it; newer brew nags about untrusted taps
+          brew install cocoapods
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: stable
+          targets: aarch64-apple-ios
+
+      - name: Import code signing
+        env:
+          IOS_BUILD_CERTIFICATE_BASE64: ${{ secrets.IOS_BUILD_CERTIFICATE_BASE64 }}
+          IOS_BUILD_PROVISION_PROFILE_BASE64: ${{ secrets.IOS_BUILD_PROVISION_PROFILE_BASE64 }}
+          IOS_P12_PASSWORD: ${{ secrets.IOS_P12_PASSWORD }}
+          IOS_KEYCHAIN_PASSWORD: ${{ secrets.IOS_KEYCHAIN_PASSWORD }}
+        run: |
+          CERTIFICATE_PATH=$RUNNER_TEMP/build_certificate.p12
+          PP_PATH=$RUNNER_TEMP/build_pp.mobileprovision
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          echo -n "$IOS_BUILD_CERTIFICATE_BASE64" | base64 --decode -o $CERTIFICATE_PATH
+          echo -n "$IOS_BUILD_PROVISION_PROFILE_BASE64" | base64 --decode -o $PP_PATH
+          security create-keychain -p "$IOS_KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
+          security list-keychains -d user -s $KEYCHAIN_PATH
+          security import $CERTIFICATE_PATH -P "$IOS_P12_PASSWORD" -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
+          security set-key-partition-list -S apple-tool:,apple: -k "$IOS_KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          cp $PP_PATH ~/Library/MobileDevice/Provisioning\ Profiles/build_pp.mobileprovision
+
+      - name: Configure Xcode for manual signing
+        run: |
+          PP_PATH="$HOME/Library/MobileDevice/Provisioning Profiles/build_pp.mobileprovision"
+          security cms -D -i "$PP_PATH" -o "$RUNNER_TEMP/profile.plist"
+          PROFILE_UUID=$(plutil -extract UUID raw "$RUNNER_TEMP/profile.plist")
+          sed -i '' 's/CODE_SIGN_STYLE = Automatic;/CODE_SIGN_STYLE = Manual;/g' ios/Runner.xcodeproj/project.pbxproj
+          sed -i '' "s/PROVISIONING_PROFILE_SPECIFIER = \"\";/PROVISIONING_PROFILE_SPECIFIER = \"$PROFILE_UUID\";/g" ios/Runner.xcodeproj/project.pbxproj
+          sed -i '' 's/"CODE_SIGN_IDENTITY\[sdk=iphoneos\*\]" = "iPhone Developer";/"CODE_SIGN_IDENTITY[sdk=iphoneos*]" = "Apple Distribution";/g' ios/Runner.xcodeproj/project.pbxproj
+          cat > ios/ExportOptions.plist << 'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>app-store</string>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>org.magicgrants.skylightwallet</key>
+              <string>PROFILE_UUID_PLACEHOLDER</string>
+            </dict>
+            <key>signingCertificate</key>
+            <string>Apple Distribution</string>
+            <key>signingStyle</key>
+            <string>manual</string>
+          </dict>
+          </plist>
+          EOF
+          sed -i '' "s/PROFILE_UUID_PLACEHOLDER/$PROFILE_UUID/g" ios/ExportOptions.plist
+
+      - name: Build IPA
+        run: |
+          flutter pub get --enforce-lockfile
+          flutter build ipa --dart-define=DEMO_MODE=true --release --export-options-plist=ios/ExportOptions.plist
+
+      - name: Prepare artifact
+        run: |
+          VERSION='${{ needs.version.outputs.version }}'
+          mkdir -p dist
+          cp -v build/ios/ipa/*.ipa "dist/skylight-wallet-${VERSION}.ipa"
+
+      - name: Upload to App Store Connect
+        env:
+          APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          APP_STORE_CONNECT_PRIVATE_KEY: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.appstoreconnect/private_keys
+          echo "$APP_STORE_CONNECT_PRIVATE_KEY" > ~/.appstoreconnect/private_keys/AuthKey_${APP_STORE_CONNECT_KEY_ID}.p8
+          chmod 600 ~/.appstoreconnect/private_keys/AuthKey_${APP_STORE_CONNECT_KEY_ID}.p8
+          VERSION='${{ needs.version.outputs.version }}'
+          xcrun altool --upload-app \
+            --type ios \
+            --file "dist/skylight-wallet-${VERSION}.ipa" \
+            --apiKey "$APP_STORE_CONNECT_KEY_ID" \
+            --apiIssuer "$APP_STORE_CONNECT_ISSUER_ID"
+
+  release:
+    name: Sign + Release
+    if: ${{ !endsWith(github.ref_name, '-test') }}
+    runs-on: ubuntu-latest
+    environment: Release
+    needs:
+      - version
+      - build-android
+      - build-linux-x86_64
+      - build-windows
+    permissions:
+      contents: write
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+
+      - name: List downloaded artifacts
+        run: |
+          echo "=== dist tree ==="
+          find dist -type f -maxdepth 3 -print
+
+      - name: Import GPG key
+        run: |
+          echo "${{ secrets.GPG_PRIVATE_KEY }}" | gpg --batch --import
+
+      - name: Sign artifacts with GPG
+        env:
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          find dist -type f \( -name "*.apk" -o -name "*.aab" -o -name "*.deb" -o -name "*.AppImage" -o -name "*.exe" \) -print0 | while IFS= read -r -d '' file; do
+            echo "$GPG_PASSPHRASE" | gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 --detach-sign --armor "$file"
+            echo "Signed: $file"
+          done
+
+          echo "=== Generated signatures ==="
+          find dist -name "*.asc" -type f -print
+
+      - name: Create Release
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
+        with:
+          name: ${{ needs.version.outputs.tag }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: |
+            dist/**/*.apk
+            dist/**/*.apk.asc
+            dist/**/*.aab
+            dist/**/*.aab.asc
+            dist/**/*.deb
+            dist/**/*.deb.asc
+            dist/**/*.AppImage
+            dist/**/*.AppImage.asc
+            dist/**/*.exe
+            dist/**/*.exe.asc
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          
